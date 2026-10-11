@@ -66,9 +66,6 @@ Caching and fallback were also verified directly: an identical prompt sent twice
 ## Setup
 
 ```bash
-# clone and enter the repo
-git clone https://github.com/PRANAVKAKDE613/Unified-LLM-Gateway.git
-cd Unified-LLM-Gateway
 
 # create and activate a virtual environment
 python -m venv venv

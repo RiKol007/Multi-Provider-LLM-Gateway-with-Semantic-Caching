@@ -1,51 +1,46 @@
-# Unified LLM Gateway
+# Multi-Provider LLM Gateway with Semantic Caching
 
-A production-style, provider-agnostic proxy for LLM APIs. It mirrors the OpenAI `chat/completions` contract, so any existing OpenAI SDK client can point at it with zero code changes. Behind that single endpoint, the gateway routes requests across multiple providers, caches repeated and near-duplicate prompts, enforces per-user budgets, and automatically fails over when a provider is down.
+An OpenAI-compatible gateway that sits between your application and multiple LLM providers. Point any OpenAI SDK client at it, and the gateway routes each request to OpenAI, Groq or Anthropic Claude, serves repeated and reworded prompts from a Redis cache, tracks cost per user, and automatically switches providers when one fails.
 
-Built as a hands-on learning project to understand how real LLM infrastructure (the kind used by tools like LiteLLM and Portkey) works under the hood.
+> Built as a hands-on project to learn how real LLM infrastructure (similar to LiteLLM or Portkey) works under the hood.
 
-**Authors:** [Ritesh Kolte](https://github.com/RiKol007) and Pranav Kakde
+## Highlights
 
-## Features
+| Capability | How it works |
+|---|---|
+| **One API, three providers** | A single `/v1/chat/completions` endpoint in the OpenAI format; the model name decides whether OpenAI, Groq or Anthropic handles the request |
+| **Automatic fallback** | If a provider fails (auth error, rate limit, outage), the request is retried on the next provider in a fallback chain |
+| **Two-layer caching** | Exact match via a SHA-256 hash of the request, plus semantic match via sentence-transformer embeddings (cosine similarity ≥ 0.92), both stored in Redis with TTL expiry |
+| **Cost tracking** | Token usage is converted to USD with per-model pricing, logged per user, and checked against a budget cap |
+| **Monitoring** | Prometheus-format metrics at `/metrics` and a live dashboard at `/dashboard` |
 
-- **Provider-agnostic routing:** accepts standard OpenAI-shaped requests and routes them to OpenAI, Groq or Anthropic based on the model name, then normalizes every provider's response into one consistent shape.
-- **Two-layer caching:** an exact-match layer (SHA-256 hash of the request, stored in Redis) catches identical repeats; a semantic layer (local sentence-transformer embeddings + cosine similarity, threshold 0.92) catches differently worded near-duplicates. Both use Redis with TTL-based expiry.
-- **Per-user cost metering:** token usage is converted into a real USD cost using per-model pricing tables, logged to a database, and checked against a per-user budget cap.
-- **Automatic provider fallback:** if the requested provider fails (auth error, rate limit, outage), the gateway retries through a fallback chain on other providers, so the caller still gets a successful response.
-- **Observability:** Prometheus-format metrics at `/metrics` (latency, cache hits, provider success/failure, cost per user), plus a lightweight live dashboard at `/dashboard`.
-- **Load tested:** validated with Locust under 100 concurrent simulated users.
-
-## Architecture
+## How a request flows
 
 ```
-Client (OpenAI SDK or raw HTTP)
+Client (OpenAI SDK / HTTP)
         │
         ▼
-  FastAPI /v1/chat/completions
+FastAPI  /v1/chat/completions
         │
-        ├─► Exact-match cache check (Redis, SHA-256 key)
-        ├─► Semantic cache check (local embeddings, cosine similarity ≥ 0.92)
+        ├── 1. Exact-match cache (Redis, SHA-256 key) ──── hit ──► return cached answer
+        ├── 2. Semantic cache (embeddings, cos ≥ 0.92) ─── hit ──► return cached answer
         │
-        ▼ (cache miss)
-  Provider router (model name → provider)
+        ▼ miss
+Router: model name → provider (Groq / OpenAI / Anthropic)
         │
-        ├─► Groq adapter ──────┐
-        ├─► OpenAI adapter ────┼─► Normalizer → unified response shape
-        └─► Anthropic adapter ─┘
-        │
-        ▼ (on failure)
-  Fallback chain → retry on next provider
+        ├── success ──► normalize response to OpenAI format
+        └── failure ──► fallback chain → next provider
         │
         ▼
-  Cost calculation → budget check → DB log (SQLite / Postgres-ready)
+Cost calculation → budget check → log to database
         │
         ▼
-  Prometheus metrics + live dashboard
+Metrics (/metrics) and dashboard (/dashboard)
 ```
 
-### Model routing and fallback
+### Routing table
 
-| Model name contains | Provider | Fallback order |
+| Model name contains | Primary provider | Fallback order |
 |---|---|---|
 | `llama`, `mixtral`, `gemma` | Groq | OpenAI (`gpt-4o-mini`) → Anthropic (`claude-3-5-haiku`) |
 | `claude` | Anthropic | Groq (`llama-3.1-8b-instant`) → OpenAI (`gpt-4o-mini`) |
@@ -53,107 +48,71 @@ Client (OpenAI SDK or raw HTTP)
 
 ## Tech stack
 
-Python, FastAPI, Redis, SQLAlchemy (SQLite locally, Postgres-ready), Prometheus client, sentence-transformers, Locust, Docker Compose, OpenAI / Groq / Anthropic SDKs.
+**Backend:** Python, FastAPI, Pydantic
+**Caching:** Redis, sentence-transformers
+**Database:** SQLAlchemy (SQLite for local development, PostgreSQL-ready via Docker Compose)
+**Providers:** OpenAI, Groq and Anthropic SDKs
+**Monitoring and testing:** Prometheus client, Locust
 
-## Results from testing
+## Test results
 
-These numbers come from an actual local Locust run against this codebase, not estimates:
+Measured with Locust on a local machine:
 
 | Metric | Result |
 |---|---|
-| Concurrent simulated users | 100 |
+| Concurrent users | 100 |
 | Total requests | 480 |
-| Failure rate | 0% |
-| Sustained throughput | ~32.8 requests/sec |
-| Median latency | 63 ms |
-| p95 latency | 2.1 s |
-| p99 latency | 2.4 s |
+| Failure rate | **0%** |
+| Throughput | ~32.8 requests/sec |
+| Median latency | **63 ms** |
+| p95 / p99 latency | 2.1 s / 2.4 s |
 
-The low median versus the higher p95 reflects the cache working as intended: most repeated or similar prompts resolve in milliseconds from Redis, while genuine cache misses pay the full cost of a real upstream LLM call.
+Cached prompts return in milliseconds, which keeps the median low; the higher p95 comes from genuine cache misses that wait for a real LLM response.
 
-Caching and fallback were also verified directly:
+Verified behaviour:
 
-- An identical prompt sent twice produced a `CACHE HIT` on the second call, with no upstream request.
-- A differently worded but equivalent prompt ("What is the capital of France?" vs. "Tell me what city is the capital of France") scored 0.93 cosine similarity and was served from cache.
-- A request routed to a provider with no billing configured was automatically retried through the fallback chain and still returned a successful response.
+- **Exact cache:** sending the same prompt twice returned a cache hit the second time, with no provider call.
+- **Semantic cache:** "What is the capital of France?" and "Tell me what city is the capital of France" scored 0.93 similarity, so the second was served from cache.
+- **Fallback:** a request sent to a provider without billing set up was retried automatically on another provider and still succeeded.
 
-## Project structure
-
-```
-app/
-├── main.py              # FastAPI app, /health, /metrics, /dashboard
-├── routers/
-│   ├── chat.py          # POST /v1/chat/completions
-│   └── dashboard.py     # GET /dashboard/data (feeds the live dashboard)
-├── providers/           # OpenAI, Groq and Anthropic adapters
-├── core/
-│   ├── router.py        # model → provider routing and fallback chain
-│   ├── cache.py         # exact-match + semantic caching (Redis)
-│   ├── embeddings.py    # sentence-transformer embeddings, cosine similarity
-│   ├── normalizer.py    # unified response format
-│   ├── pricing.py       # per-model token pricing
-│   ├── billing.py       # cost calculation and budget checks
-│   ├── database.py      # SQLAlchemy models and session
-│   ├── metrics.py       # Prometheus metrics
-│   └── config.py        # environment configuration
-├── models/chat.py       # request/response schemas
-└── static/dashboard.html
-locustfile.py            # load test
-set_low_budget.py        # sets a near-zero budget to test budget enforcement
-check_user.py            # prints a user's budget and total spend
-docker-compose.yml       # Redis (and Postgres) containers
-```
-
-## Setup
+## Getting started
 
 ```bash
-# clone and enter the repo
 git clone https://github.com/RiKol007/Unified-LLM-Gateway.git
 cd Unified-LLM-Gateway
 
-# create and activate a virtual environment
 python -m venv venv
-venv\Scripts\activate        # Windows
-# source venv/bin/activate   # macOS/Linux
+venv\Scripts\activate            # Windows
+# source venv/bin/activate       # macOS / Linux
 
-# install dependencies
 pip install -r requirements.txt
 
-# configure environment
-cp .env.example .env
-# then fill in OPENAI_API_KEY, GROQ_API_KEY, ANTHROPIC_API_KEY
+cp .env.example .env             # add your OPENAI, GROQ and ANTHROPIC API keys
 
-# start Redis (requires Docker)
-docker compose up -d redis
-
-# run the server
-uvicorn app.main:app --reload
+docker compose up -d redis       # start Redis
+uvicorn app.main:app --reload    # start the gateway
 ```
 
-Then visit:
+| URL | What you get |
+|---|---|
+| `http://127.0.0.1:8000/docs` | Interactive API docs |
+| `http://127.0.0.1:8000/dashboard` | Live dashboard |
+| `http://127.0.0.1:8000/metrics` | Raw Prometheus metrics |
 
-- `http://127.0.0.1:8000/docs`: interactive API docs
-- `http://127.0.0.1:8000/dashboard`: live metrics dashboard
-- `http://127.0.0.1:8000/metrics`: raw Prometheus metrics
-
-## Usage
-
-Point any OpenAI SDK client at the gateway. The optional `X-User` header identifies the user for cost metering (it defaults to `testuser`).
+## Example request
 
 ```python
 from openai import OpenAI
 
 client = OpenAI(base_url="http://127.0.0.1:8000/v1", api_key="not-needed")
 
-response = client.chat.completions.create(
+reply = client.chat.completions.create(
     model="llama-3.1-8b-instant",
     messages=[{"role": "user", "content": "What is the capital of France?"}],
-    extra_headers={"X-User": "testuser"},
+    extra_headers={"X-User": "testuser"},   # identifies the user for cost tracking
 )
-print(response.choices[0].message.content)
+print(reply.choices[0].message.content)
 ```
-
-Or with curl:
 
 ```bash
 curl http://127.0.0.1:8000/v1/chat/completions \
@@ -167,20 +126,44 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 ```bash
 pip install locust
 locust -f locustfile.py --host http://127.0.0.1:8000
+# open http://localhost:8089 and choose the number of users
 ```
 
-Then open `http://localhost:8089` and set the number of users.
+## Project structure
 
-## Known limitations
+```
+app/
+├── main.py              FastAPI app: /health, /metrics, /dashboard
+├── routers/
+│   ├── chat.py          POST /v1/chat/completions
+│   └── dashboard.py     data for the live dashboard
+├── providers/           OpenAI, Groq and Anthropic adapters
+├── core/
+│   ├── router.py        model → provider routing and fallback chain
+│   ├── cache.py         exact-match and semantic caching (Redis)
+│   ├── embeddings.py    sentence-transformer embeddings and similarity
+│   ├── normalizer.py    converts every provider's reply to one format
+│   ├── pricing.py       per-model token prices
+│   ├── billing.py       cost calculation and budget checks
+│   ├── database.py      SQLAlchemy models and session
+│   ├── metrics.py       Prometheus metrics
+│   └── config.py        environment settings
+├── models/chat.py       request and response schemas
+└── static/dashboard.html
+locustfile.py            load test
+set_low_budget.py        sets a tiny budget to test budget enforcement
+check_user.py            shows a user's budget and spend
+docker-compose.yml       Redis and PostgreSQL containers
+```
 
-This was built as a learning project, and a few things are deliberately simplified rather than production-hardened:
+## Limitations and next steps
 
-- **Database:** runs on SQLite locally instead of Postgres, because of local disk constraints during development. The data layer uses SQLAlchemy, so switching to Postgres is a connection-string change.
-- **OpenAI / Anthropic billing:** both adapters are fully implemented and were verified to build correct requests, but live end-to-end testing was mainly done against Groq, since OpenAI and Anthropic require funded billing accounts. This is also how the fallback chain was proven: requests to the unfunded providers correctly failed over to Groq.
-- **Semantic cache index:** stored as a simple capped list in Redis with brute-force cosine similarity. This works at demo scale, but production scale would need a vector database (e.g. pgvector, Qdrant or Pinecone).
-- **Auth:** users are identified by a simple `X-User` header rather than issued API keys, since a full auth system was out of scope.
-- **Observability:** metrics are exposed in Prometheus format, ready to be scraped by a real Prometheus + Grafana stack; the `/dashboard` page is a lightweight substitute used to avoid installing Grafana on a space-constrained dev machine.
+- **Database:** runs on SQLite locally; moving to PostgreSQL only needs a new connection string, since the data layer uses SQLAlchemy.
+- **Provider testing:** OpenAI and Anthropic adapters are implemented, but live testing used mainly Groq because the others need paid accounts. This is also how the fallback chain was proven.
+- **Semantic cache scale:** embeddings are compared one by one; larger traffic would need a vector database such as pgvector or Qdrant.
+- **Authentication:** users are identified by an `X-User` header; real API keys would be the next step.
+- **Monitoring:** metrics are Prometheus-ready for a full Prometheus + Grafana setup; the built-in dashboard is a lightweight alternative.
 
-## License
+## Contributors
 
-MIT
+- **[Ritesh Kolte](https://github.com/RiKol007):** FastAPI service, provider routing and fallback, Redis caching (exact and semantic), SQLAlchemy data layer
